@@ -25,7 +25,9 @@ width: 100%;
 </style>
 ```
 
+
 # Will is making more changes
+
 
 ```{r knitr setup, include=FALSE}
 ### The following parameters declare the options for compiling the Markdown document.
