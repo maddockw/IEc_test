@@ -1,0 +1,316 @@
+---
+title: "FrEDI State Mental Health"
+author: "Industrial Economics, Inc."
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  rmarkdown::html_document:
+    theme: spacelab
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{=html}
+<style>
+/* Simplified version of Bootstrap's responsive table CSS */
+.table-responsive {
+display: block;
+width: 100%;
+overflow-x: auto;
+}
+
+.table-responsive > table {
+width: 100%;
+}
+</style>
+```
+
+# Will is making changes
+
+```{r knitr setup, include=FALSE}
+### The following parameters declare the options for compiling the Markdown document.
+knitr::opts_chunk$set(
+  include = T,     ### Evaluate and depict outputs of code chunks in the compiled document
+  echo    = T,     ### Echo the commands of the code chunks in the compiled document
+  message = FALSE, ### Don't include command-line messages output from evaluating code chunks
+  cache   = FALSE, ### Don't cache the evaluation of code chunks
+  warning = FALSE, ### Don't include warnings from evaluating code chunks
+  table.format = "html" 
+)
+```
+
+```{r load packages, echo = F}
+library(tidyverse)
+library(readxl)
+```
+
+## Set up workspace
+
+### Set Paths
+
+```{r set paths}
+# set relative file paths and create lists of input files
+projPath      <- getwd()
+dataPath      <- projPath %>% file.path("extdata")
+codePath      <- projPath %>% file.path("code")
+outPath       <- projPath %>% file.path("outputs")
+today         <- format(Sys.Date(), "%Y%m%d")
+files         <- list.files(dataPath)
+labor_file    <- files %>% grep("projections", ., value = T)
+```
+
+### Code & custom functions
+
+```{r load code}
+for(code_i in list.files(codePath, pattern=".R", full.names = T)){source(code_i)}
+```
+
+### Set constants
+
+```{r set constants}
+# toggle whether to save intermediate and final files
+int_saveFiles <- FALSE
+saveFiles <- TRUE
+```
+
+### Read in data
+
+The study authors provided annual time series data for hours lost per high risk worker under RCP 8.5 by state and GCM.
+
+```{r read in data}
+# loop through FUTURE files, filter to just the HIF we'll use (AVERAGE), and save the data in a df
+labor_data <- dataPath %>%
+  file.path(labor_file) %>%
+  read.csv %>%
+  filter(rcp == "rcp45") %>%
+  select(c(run, year, state, highrisk, losthours_worker))
+
+gcms <- labor_data$run %>% unique
+
+# read in state naming crosswalk
+state_crosswalk <- file.path(dataPath, "State Crosswalk.xlsx") %>% read_xlsx(sheet = "States")
+```
+
+## Process data
+
+### Calculate FrEDI impact inputs
+
+The provided data already includes per capita rates (though note that the population is limited to high-risk workers) relative to baseline at the state level. No aggregation, dollar year adjustment, or removal of baseline is required. We simply degree bin and format the data for use in FrEDI.
+
+```{r FrEDI impacts}
+labor_fredi <- labor_data %>%
+  select(-highrisk) %>%
+  pivot_wider(id_cols = c(state, run), names_from = year, values_from = losthours_worker) %>%
+  rename(ST_fips = state,
+         model   = run) %>%
+  degree_bin_annual(gcms = gcms) %>%
+  left_join(state_crosswalk, by = c("ST_fips" = "ST_fips_alt")) %>%
+  select(ST_full, ST_postal, gcm, degree, value) %>%
+  mutate(sector     = "Labor",
+         variant    = NA,
+         impactType = NA,
+         impactYear = NA) %>%
+  rename(state          = ST_full,
+         postal         = ST_postal,
+         model          = gcm,
+         modelUnitValue = degree)
+
+if (saveFiles) {
+  labor_fredi %>% write.csv(file.path(outPath, "Labor_scaledimpacts.csv"), row.names = F)
+}
+```
+
+```{r impacts qc check}
+all(labor_fredi$state %in% state_crosswalk$ST_full) && all(state_crosswalk$ST_full %in% labor_fredi$state)
+```
+
+
+```{r wm check}
+labor_fredi_reg <- labor_data %>%
+  mutate(st_hours = losthours_worker * highrisk) %>%
+  select(-losthours_worker) %>%
+  mutate(state = as.character(state)) %>%
+  left_join(state_crosswalk, by = c("state" = "ST_fips_alt")) %>% 
+  group_by(run, year, NCA_region) %>%
+  summarize(reg_hrs = sum(st_hours),
+            reg_highrisk  = sum(highrisk)) %>%
+  mutate(reg_percap = reg_hrs/reg_highrisk) %>%
+  select(-reg_highrisk, -reg_hrs) %>%
+  rename(ST_fips = NCA_region,
+         model = run) %>%
+  pivot_wider(id_cols = c(ST_fips, model), names_from = year, values_from = reg_percap) %>%
+  degree_bin_annual(gcms = gcms) #%>%
+
+  # left_join(state_crosswalk, by = c("ST_fips" = "ST_fips_alt")) %>%
+  # select(ST_full, ST_postal, gcm, degree, value) %>%
+  # mutate(sector     = "Labor",
+  #        variant    = NA,
+  #        impactType = NA,
+  #        impactYear = NA) %>%
+  # rename(state          = ST_full,
+  #        postal         = ST_postal,
+  #        model          = gcm,
+  #        modelUnitValue = degree)
+```
+
+### Calculate scalars
+
+There are two scalars for this sector, one capturing the high-risk labor population and the other capturing the wage rate used to calculate economic values from the physical impacts.
+
+For the first, the underlying study holds the high-risk worker population constant over time, and these population values are provided at the state level in the initial data.
+
+#### High-risk worker population
+
+```{r highRiskLabor_pop scalar}
+#### UDPATE THIS to remove duplication of scalars
+high_risk_pop <- labor_data %>%
+  select(state, highrisk) %>%
+  distinct
+
+high_risk_pop <- high_risk_pop %>%
+  # bind_rows(high_risk_pop, .id = "id") %>%
+  # mutate(year  = case_when(
+  #   id == 1 ~ 2010,
+  #   id == 2 ~ 2090),
+  #   scalarName = "highRiskLabor_pop",
+  #   state      = as.character(state)) %>%
+  mutate(scalarName = "highRiskLabor_pop",
+         state = as.character(state),
+         year = 2010) %>%
+  left_join(state_crosswalk, by = c("state" = "ST_fips_alt")) %>%
+  select(ST_full, ST_postal, scalarName, year, highrisk) %>%
+  rename(value  = highrisk,
+         state  = ST_full,
+         postal = ST_postal)
+
+if (saveFiles){
+  high_risk_pop %>% write.csv(file.path(outPath, "Scalar_physScalar_highRiskLabor_pop.csv"), row.names = F)
+}
+```
+
+```{r highRiskLabor_pop qc check}
+
+```
+
+#### High-risk worker wage rate 
+
+A wage rate for high-risk workers is used to scale the lost hours impact to calculate economic damages in dollars. The FrEDI input is a single 2010 value (in 2015$) used for all states, and this value is scaled by GDP/capita over time in FrEDI.
+
+```{r highRiskWages_usd scalar}
+high_risk_wage <- data.frame(
+  state      = "National Total",
+  postal     = NA,
+  scalarName = "highRiskWages_usd",
+  year       = 2010,
+  value      = 25.001482212755
+)
+
+if (saveFiles){
+  high_risk_wage %>% write.csv(file.path(outPath, "Scalar_econScalar_highRiskWages_usd.csv"), row.names = F)
+}
+```
+
+## RCP 4.5 vs. RCP 8.5 QC Plotting
+
+```{r aggregate 4.5 to nation}
+labor4.5 <- labor_fredi %>%
+  left_join(high_risk_pop, by = "state") %>%
+  mutate(total_impacts = value.x * value.y) %>%
+  group_by(model, modelUnitValue) %>%
+  summarize(impacts = sum(total_impacts),
+            pop     = sum(value.y),
+            .groups = "drop") %>%
+  mutate(impacts_per_cap = impacts / pop,
+         scenario        = "RCP 4.5") %>%
+  select(model, modelUnitValue, impacts_per_cap, scenario)
+```
+
+```{r aggregate 8.5 to nation}
+labor8.5 <- outPath %>% file.path("outputs_8.5", "Labor_scaledimpacts.csv") %>% read.csv %>%
+  left_join(high_risk_pop, by = "state") %>%
+  mutate(total_impacts = value.x * value.y) %>%
+  group_by(model, modelUnitValue) %>%
+  summarize(impacts = sum(total_impacts),
+            pop     = sum(value.y),
+            .groups = "drop") %>%
+  mutate(impacts_per_cap = impacts / pop,
+         scenario        = "RCP 8.5") %>%
+  select(model, modelUnitValue, impacts_per_cap, scenario) %>%
+  filter(modelUnitValue <= 3)
+```
+
+```{r plot by rcp}
+labor_combined <- rbind(labor4.5, labor8.5)
+
+labor_means <- labor_combined %>%
+  group_by(scenario, modelUnitValue) %>%
+  summarize(impacts_per_cap = mean(impacts_per_cap),
+            .groups         = "drop") %>%
+  mutate(model = "GCM Mean")
+
+labor_combined <- rbind(labor4.5, labor8.5, labor_means)
+
+labor_zero <- labor_combined %>%
+  select(-c(impacts_per_cap, modelUnitValue)) %>%
+  distinct %>%
+  mutate(modelUnitValue = 0,
+         impacts_per_cap = 0)
+
+labor_combined <- rbind(labor4.5, labor8.5, labor_means, labor_zero) %>%
+  mutate(`Model Type` = case_when(
+           model != "GCM Mean" ~ "Individual GCM",
+           TRUE                ~ "GCM Average"
+         ))
+
+labor_plot <- ggplot(labor_combined, aes(x = modelUnitValue, y = impacts_per_cap, group = interaction(model, scenario), color = scenario, alpha = factor(`Model Type`), linetype = `Model Type`)) +
+  geom_line(linewidth = .75) +
+  scale_linetype_manual(values = c("Individual GCM" = 2, "GCM Average" = 1)) +
+  scale_alpha_manual(values = c("Individual GCM" = 0.4, "GCM Average" = 1), guide='none') +
+  labs(title = "Labor, National, Per Capita",
+       x = "Degrees of Warming",
+       y = "Impact per capita",
+       color = "Scenario",
+       linetype = "Model Type") +
+  theme(legend.position = "right")
+print(labor_plot)
+
+ggsave("Labor_RCP_Comparison.png", plot = labor_plot, path = outPath)
+```
+
+```{r plot with differentiated GCMs}
+labor_combined <- rbind(labor4.5, labor8.5)
+
+labor_means <- labor_combined %>%
+  group_by(scenario, modelUnitValue) %>%
+  summarize(impacts_per_cap = mean(impacts_per_cap),
+            .groups         = "drop") %>%
+  mutate(model = "GCM Mean")
+
+labor_combined <- rbind(labor4.5, labor8.5, labor_means)
+
+labor_zero <- labor_combined %>%
+  select(-c(impacts_per_cap, modelUnitValue)) %>%
+  distinct %>%
+  mutate(modelUnitValue = 0,
+         impacts_per_cap = 0)
+
+labor_combined <- rbind(labor4.5, labor8.5, labor_means, labor_zero) %>%
+  mutate(`Model Type` = case_when(
+           model != "GCM Mean" ~ "Individual GCM",
+           TRUE                ~ "GCM Average"
+         ))
+
+labor_plot <- ggplot(labor_combined, aes(x = modelUnitValue, y = impacts_per_cap, group = interaction(model, scenario), color = model, linetype = scenario)) +
+  geom_line(linewidth = .75) +
+  scale_color_manual(values = c("GCM Mean" = "black", "CCSM4" = "blue", "CanESM2" = "darkred", "GFDL-CM3" = "pink", "GISS-E2-R" = "darkgreen", "HadGEM2-ES" = "purple", "MIROC5" = "orange")) +
+  labs(title = "Labor, National, Per Capita",
+       x = "Degrees of Warming",
+       y = "Impact per capita",
+       color = "Model",
+       linetype = "Scenario") +
+  theme(legend.position = "right")
+print(labor_plot)
+
+ggsave("Labor_RCP_Comparison_byGCM.png", plot = labor_plot, path = outPath)
+```
+
